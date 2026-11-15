@@ -1,5 +1,9 @@
 # Token Launch Radar: the pre-token universe, priced off its own trading tokens
 
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/tmobgtt/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/tmobgtt/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+
 token-radar-01 · research note · snapshot as of 2026-11-14 (DefiLlama, 758 protocols at $5M TVL and above, floor $50M)
 
 198 protocols that record no token, each priced by a comps fit on the snapshot's own calibration tokens and given a farm plan netted to the dollar. The method is stated before the ranking it produces, and the dashboard re-runs the fit in the browser to check the board's figures.
