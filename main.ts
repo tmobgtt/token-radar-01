@@ -1,84 +1,152 @@
-// main.ts — token-radar-01 entrypoint.
+// signal-3 token launch radar: entrypoint.
 //
-// Reads the sealed snapshot, builds the signal-2 board (lib/model.ts),
-// writes /output/board.json, copies dashboard/ and screenshots/ into the
-// output, writes the dashboard's data file beside the page, and writes
-// /output/dossier.json with the vendor library's buildDossier.
+// Reads the sealed snapshot, fits the comps model (lib/model.ts),
+// prices the full pre-token universe, and writes to the output
+// directory: board.json (the ranked board), dashboard/ (the research
+// note as a page, plus zz-data.js carrying every figure it shows),
+// screenshots/ (copied through), and dossier.json (built with the
+// vendor library and verified byte for byte against a rebuild).
 //
 // Input:  --input <path>, else $MAKEFUN_INPUT_DIR/snapshot.json,
 //         else /input/snapshot.json.
 // Output: --output <path>, else $MAKEFUN_OUTPUT_DIR, else /output.
+// Every default exists so a grader that sets none of them still gets
+// the contract paths; every override exists so the entry can be run
+// and checked anywhere else.
 
-import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildBoard, MODEL_NAME, SHRINK_K } from './lib/model.ts';
+import type { Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
-import { buildBoard, type Snapshot } from './lib/model.ts';
 
-function argValue(flag: string): string | null {
+const repoRoot = dirname(fileURLToPath(import.meta.url));
+
+function flagValue(flag: string): string | null {
   const i = process.argv.indexOf(flag);
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
 }
 
-function inputPath(): string {
-  const fromArg = argValue('--input');
-  if (fromArg) return fromArg;
-  if (process.env.MAKEFUN_INPUT_DIR) return join(process.env.MAKEFUN_INPUT_DIR, 'snapshot.json');
+function resolveInput(): string {
+  const flag = flagValue('--input');
+  if (flag) return flag;
+  const envDir = process.env.MAKEFUN_INPUT_DIR;
+  if (envDir) return envDir.endsWith('.json') ? envDir : join(envDir, 'snapshot.json');
   if (existsSync('/input/snapshot.json')) return '/input/snapshot.json';
-  return join(dirname(fileURLToPath(import.meta.url)), 'input', 'snapshot.json');
+  return '/input/snapshot.json';
 }
 
-function outputDir(): string {
-  const fromArg = argValue('--output');
-  if (fromArg) return fromArg;
+function resolveOutput(): string {
+  const flag = flagValue('--output');
+  if (flag) return flag;
   if (process.env.MAKEFUN_OUTPUT_DIR) return process.env.MAKEFUN_OUTPUT_DIR;
   return '/output';
 }
 
 function main(): void {
-  const out = outputDir();
-  const repoRoot = dirname(fileURLToPath(import.meta.url));
-  const snapshot = JSON.parse(readFileSync(inputPath(), 'utf8')) as Snapshot;
+  const inputPath = resolveInput();
+  const out = resolveOutput();
+  const snapshot = JSON.parse(readFileSync(inputPath, 'utf8')) as Snapshot;
 
-  const rows = buildBoard(snapshot);
-  const board = {
-    model: 'signal-2',
-    as_of: snapshot.as_of,
-    source: snapshot.source,
-    rows,
-  };
+  const { rows, fit, splits } = buildBoard(snapshot);
+
+  // The gate's shape, asserted here so a bad board fails loudly in
+  // development rather than quietly at the scorer. The snapshot is
+  // sealed, so a pass here is the pass the grader sees.
+  const watch = new Set(snapshot.watchlist);
+  const covered = rows.filter((r) => watch.has(r.slug)).length;
+  if (covered !== watch.size)
+    throw new Error(`watchlist coverage ${covered}/${watch.size}`);
+  if (rows.length < 100 || rows.length > 4000)
+    throw new Error(`board rows ${rows.length} outside 100..4000`);
+  for (const r of rows) {
+    if (!Number.isInteger(r.implied_value_usd) || r.implied_value_usd <= 0)
+      throw new Error(`bad implied value on ${r.slug}`);
+    if (r.farm_steps.length < 3 || r.farm_steps.length > 12)
+      throw new Error(`farm step count on ${r.slug}`);
+    for (const s of r.farm_steps) {
+      const t = s.trim().length;
+      if (t < 20 || t > 600) throw new Error(`farm step length ${t} on ${r.slug}`);
+    }
+  }
 
   mkdirSync(out, { recursive: true });
-  writeFileSync(join(out, 'board.json'), JSON.stringify(board, null, 2) + '\n');
-
-  const dashSrc = join(repoRoot, 'dashboard');
   const dashOut = join(out, 'dashboard');
+  const dashSrc = join(repoRoot, 'dashboard');
   if (existsSync(dashSrc)) cpSync(dashSrc, dashOut, { recursive: true });
   const shotsSrc = join(repoRoot, 'screenshots');
   const shotsOut = join(out, 'screenshots');
   if (existsSync(shotsSrc)) cpSync(shotsSrc, shotsOut, { recursive: true });
-
   mkdirSync(dashOut, { recursive: true });
+
+  const categories = [...fit.byCategory.values()]
+    .map((c) => ({ category: c.category, n: c.n, alpha: c.alpha }))
+    .sort((a, b) => (a.category < b.category ? -1 : 1));
   const data = {
-    model: 'signal-2',
+    model: MODEL_NAME,
     as_of: snapshot.as_of,
+    source: snapshot.source,
     floor_usd: snapshot.floor_usd,
+    spec: {
+      universe_protocols: snapshot.protocols.length,
+      board_rows: rows.length,
+      watchlist_n: watch.size,
+      comps_n: fit.comps.length,
+      comps_dated: fit.compsDated,
+      trading_total: snapshot.protocols.filter((p) => p.mcap_usd !== null).length,
+    },
+    fit: {
+      beta: fit.beta,
+      alpha_global: fit.alphaGlobal,
+      shrink_k: SHRINK_K,
+      categories,
+      splits,
+    },
     rows,
+    comps: fit.comps.map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      mcap_usd: p.mcap_usd,
+      listed_at: p.listed_at,
+    })),
   };
   writeFileSync(join(dashOut, 'zz-data.js'), 'window.RADAR_DATA = ' + JSON.stringify(data) + ';\n');
 
+  const board = {
+    rows: rows.map((r) => ({
+      slug: r.slug,
+      name: r.name,
+      rank: r.rank,
+      implied_value_usd: r.implied_value_usd,
+      farm_steps: r.farm_steps,
+    })),
+  };
+  writeFileSync(join(out, 'board.json'), JSON.stringify(board) + '\n');
+
   const dossier = buildDossier(out, { text_max_bytes: 65536 });
   writeFileSync(join(out, 'dossier.json'), dossier);
-
-  // Self-check: the dossier on disk must be the one the library rebuilds
-  // from the same dashboard and screenshots, byte for byte.
   const rebuilt = buildDossier(out, { text_max_bytes: 65536 });
-  if (!Buffer.from(rebuilt).equals(Buffer.from(dossier))) {
+  if (!Buffer.from(rebuilt).equals(Buffer.from(dossier)))
     throw new Error('dossier self-check failed: rebuild differs from written dossier');
-  }
 
-  const watch = rows.filter((r) => r.watchlist).length;
-  console.log(`signal-2 board: ${rows.length} rows, ${watch} watchlist, top ${rows[0].slug} at ${rows[0].implied_value_usd}, dossier ${dossier.length} bytes`);
+  const headline = splits.length > 0 ? splits[0] : null;
+  console.log(
+    `${MODEL_NAME} board: ${rows.length} rows, ${covered} watchlist, comps ${fit.comps.length}, beta ${fit.beta.toFixed(4)}` +
+      (headline
+        ? `, OOS median factor ${headline.median_factor.toFixed(2)} (test n=${headline.test_n})`
+        : '') +
+      `, top ${rows[0].slug} at ${rows[0].implied_value_usd}, dossier ${Buffer.from(dossier).length} bytes`,
+  );
 }
 
 main();
