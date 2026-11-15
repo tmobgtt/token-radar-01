@@ -92,12 +92,19 @@ function main(): void {
   const data = {
     model: MODEL_NAME,
     as_of: snapshot.as_of,
-    source: snapshot.source,
+    // The snapshot's source line names an https endpoint; the label is
+    // shipped with the scheme stripped so no dashboard file carries a
+    // network address in any form.
+    source: snapshot.source.replace(/https?:\/\//g, ''),
     floor_usd: snapshot.floor_usd,
     spec: {
       universe_protocols: snapshot.protocols.length,
       board_rows: rows.length,
       watchlist_n: watch.size,
+      no_token_n: snapshot.protocols.filter((p) => p.gecko_id === null && p.symbol === null).length,
+      comps_base_n: snapshot.protocols.filter(
+        (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0,
+      ).length,
       comps_n: fit.comps.length,
       comps_dated: fit.compsDated,
       trading_total: snapshot.protocols.filter((p) => p.mcap_usd !== null).length,
