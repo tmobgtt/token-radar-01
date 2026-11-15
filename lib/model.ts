@@ -235,6 +235,12 @@ function mechanicFor(category: string | null): Mechanic {
         first: 'bridge funds in and transact with the chain\u2019s native apps',
         weekly: 'keep a cadence of native transactions across at least three different apps',
       };
+    case 'Risk Curators':
+    case 'Onchain Capital Allocator':
+      return {
+        first: 'allocate capital into its curated vaults, split across at least two of them',
+        weekly: 'rebalance between its vaults toward the best risk-adjusted rate and compound the yield',
+      };
     case 'RWA':
       return {
         first: 'complete its onboarding and buy a first tranche of its tokenised assets',

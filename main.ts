@@ -24,7 +24,8 @@ function inputPath(): string {
   const fromArg = argValue('--input');
   if (fromArg) return fromArg;
   if (process.env.MAKEFUN_INPUT_DIR) return join(process.env.MAKEFUN_INPUT_DIR, 'snapshot.json');
-  return '/input/snapshot.json';
+  if (existsSync('/input/snapshot.json')) return '/input/snapshot.json';
+  return join(dirname(fileURLToPath(import.meta.url)), 'input', 'snapshot.json');
 }
 
 function outputDir(): string {
@@ -69,8 +70,15 @@ function main(): void {
   const dossier = buildDossier(out, { text_max_bytes: 65536 });
   writeFileSync(join(out, 'dossier.json'), dossier);
 
+  // Self-check: the dossier on disk must be the one the library rebuilds
+  // from the same dashboard and screenshots, byte for byte.
+  const rebuilt = buildDossier(out, { text_max_bytes: 65536 });
+  if (!Buffer.from(rebuilt).equals(Buffer.from(dossier))) {
+    throw new Error('dossier self-check failed: rebuild differs from written dossier');
+  }
+
   const watch = rows.filter((r) => r.watchlist).length;
-  console.log(`signal-2 board: ${rows.length} rows, ${watch} watchlist, top ${rows[0].slug} at ${rows[0].implied_value_usd}`);
+  console.log(`signal-2 board: ${rows.length} rows, ${watch} watchlist, top ${rows[0].slug} at ${rows[0].implied_value_usd}, dossier ${dossier.length} bytes`);
 }
 
 main();
