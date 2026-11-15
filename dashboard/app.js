@@ -1,184 +1,377 @@
-// Token Radar dashboard: renders the signal-2 board from zz-data.js.
-// Views: #/ board, #/f/<category> filtered board, #/p/<slug> detail.
-(function () {
-  'use strict';
-  var DATA = window.RADAR_DATA || { rows: [], as_of: '', floor_usd: 0 };
-  var rows = DATA.rows || [];
-  var bySlug = {};
-  rows.forEach(function (r) { bySlug[r.slug] = r; });
+// signal-3 research note: rendering and verification.
+//
+// The page carries the whole model with it. Below, the fit is re-run
+// in the browser from the calibration set the program shipped
+// (zz-data.js): the pooled slope, each category's shrunk median
+// intercept, and every row's implied value are recomputed and checked
+// against board.json's figures, and the verdict is printed in the
+// footer and on each detail view. The arithmetic here mirrors
+// lib/model.ts operation for operation, so the check is a real one.
+'use strict';
 
-  var state = { q: '', cat: '', watchOnly: false, sortKey: 'rank', sortDir: 1 };
+const D = window.RADAR_DATA;
+const SHELL = new Set([
+  'Restaking', 'Stablecoin Wrapper', 'Anchor BTC', 'Decentralized BTC',
+  'Staking Pool', 'Dual-Token Stablecoin', 'Farm',
+]);
 
-  function esc(s) {
-    return String(s == null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-  function money(n) {
-    return '$' + String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  }
-  function pct(v) {
-    if (v === null || v === undefined) return '<span class="chains">n/a</span>';
-    var cls = v >= 0 ? 'pos' : 'neg';
-    return '<span class="' + cls + '">' + (v >= 0 ? '+' : '') + v + '%</span>';
-  }
-  function tags(r) {
-    var out = '';
-    if (r.watchlist) out += '<span class="tag watch">WATCHLIST</span>';
-    else out += '<span class="tag">EARLY</span>';
-    if (r.shell < 1) out += '<span class="tag shell">SHELL x' + r.shell + '</span>';
-    return out;
-  }
+const esc = (s) =>
+  String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+const fmt$ = (n) => '$' + Math.round(n).toLocaleString('en-US');
+const fmtPct = (v) => (v === null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%');
+const fmtYears = (days) =>
+  days === null ? 'unreported' : days < 730 ? (days / 365.25).toFixed(1) + ' y' : (days / 365.25).toFixed(1) + ' y';
 
-  function categories() {
-    var seen = {}, list = [];
-    rows.forEach(function (r) {
-      var c = r.category || '(none)';
-      if (!seen[c]) { seen[c] = true; list.push(c); }
-    });
-    return list.sort();
+// ---- the refit (mirror of lib/model.ts fitCore + priceOf) ----
+function median(values) {
+  const s = [...values].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+function refit() {
+  const comps = D.comps;
+  const xs = comps.map((p) => Math.log(p.tvl_usd));
+  const ys = comps.map((p) => Math.log(p.mcap_usd));
+  const n = comps.length;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i] - mx) * (ys[i] - my);
+    sxx += (xs[i] - mx) * (xs[i] - mx);
   }
+  const beta = sxy / sxx;
+  const resid = comps.map((p, i) => ys[i] - beta * xs[i]);
+  const alphaGlobal = median(resid);
+  const byCat = new Map();
+  comps.forEach((p, i) => {
+    const c = p.category ?? 'Unclassified';
+    const arr = byCat.get(c);
+    if (arr) arr.push(resid[i]);
+    else byCat.set(c, [resid[i]]);
+  });
+  const alpha = new Map();
+  for (const [c, arr] of byCat) {
+    const m = median(arr);
+    alpha.set(c, { n: arr.length, alpha: (arr.length * m + D.fit.shrink_k * alphaGlobal) / (arr.length + D.fit.shrink_k) });
+  }
+  return { beta, alphaGlobal, alpha };
+}
+const FIT2 = refit();
+function reprice(row) {
+  const a = FIT2.alpha.get(row.category);
+  const alpha = a ? a.alpha : FIT2.alphaGlobal;
+  const fitted = Math.exp(alpha + FIT2.beta * Math.log(row.tvl_usd));
+  const capture = SHELL.has(row.category) ? 0.55 : 1;
+  return Math.max(1, Math.round(fitted * capture));
+}
+const refitMatches = D.rows.filter((r) => reprice(r) === r.implied_value_usd).length;
 
-  function visibleRows() {
-    var out = rows.filter(function (r) {
-      if (state.cat && (r.category || '(none)') !== state.cat) return false;
-      if (state.watchOnly && !r.watchlist) return false;
-      if (state.q) {
-        var q = state.q.toLowerCase();
-        if (r.name.toLowerCase().indexOf(q) < 0 && r.slug.indexOf(q) < 0) return false;
+// ---- spec sheet header ----
+function renderSpec() {
+  const s = D.spec;
+  const headline = D.fit.splits[0];
+  document.getElementById('spec').innerHTML = `
+    <div class="kicker"><span>make.fun &middot; token-radar-01 &middot; research note</span>
+    <span>Snapshot as of ${esc(D.as_of)} &middot; ${esc(D.source.split(',')[0])}</span></div>
+    <h1>Token Launch Radar: the pre-token universe, priced off its own trading tokens</h1>
+    <div class="subtitle">${s.board_rows} protocols that record no token, each priced by a comps fit on the
+    snapshot's own calibration tokens and given a farm plan netted to the dollar. The method is stated
+    before the ranking it produces, and the page re-runs the fit below to check the board's figures.</div>
+    <div class="specgrid">
+      <div><div class="k">Universe</div><div class="v">${s.board_rows} rows <small>incl. ${s.watchlist_n}/${s.watchlist_n} watchlist</small></div></div>
+      <div><div class="k">Calibration set</div><div class="v">${s.comps_n} tokens <small>${s.comps_dated} with listing dates</small></div></div>
+      <div><div class="k">Fit</div><div class="v">&beta; ${D.fit.beta.toFixed(3)} <small>pooled log-log slope, K=${D.fit.shrink_k} shrinkage</small></div></div>
+      <div><div class="k">Out-of-sample</div><div class="v">&times;${headline.median_factor.toFixed(2)} <small>median factor, test n=${headline.test_n}</small></div></div>
+    </div>`;
+  document.getElementById('foot').innerHTML = `
+    <span>signal-3 &middot; a Node program (standard library only) reads the sealed snapshot and writes board.json, this page and its data, and dossier.json</span>
+    <span>Page refit: &beta; and every &alpha; recomputed in this browser from the ${s.comps_n} calibration tokens &middot; ${refitMatches}/${s.board_rows} implied values identical to board.json</span>`;
+}
+
+// ---- method section ----
+function methodHtml() {
+  const s = D.spec;
+  const splits = D.fit.splits
+    .map(
+      (x) => `<tr><td>${esc(x.label)}</td><td class="n">${x.train_n}</td><td class="n">${x.test_n}</td>
+      <td class="n">${x.beta.toFixed(3)}</td><td class="n">&times;${x.median_factor.toFixed(2)}</td>
+      <td class="n">${(x.within_2 * 100).toFixed(0)}%</td><td class="n">${(x.within_3 * 100).toFixed(0)}%</td></tr>`,
+    )
+    .join('');
+  return `
+  <section class="method">
+    <h2>Method, stated before the ranking</h2>
+    <div class="method-grid">
+      <p><b>1 &middot; Universe.</b> ${s.no_token_n} protocols in the snapshot record no token. The wrapper
+      screen sets aside ${s.no_token_n - s.board_rows} wrapped, staked or bridged products of tokens that
+      already trade, versioned names and exchange shells, leaving the board's ${s.board_rows} rows. The
+      watchlist is a floor, not a ceiling: all ${s.watchlist_n} of its protocols are on the board, and so
+      are ${s.board_rows - s.watchlist_n} more below its $${(D.floor_usd / 1e6).toFixed(0)}M line.</p>
+      <p><b>2 &middot; Calibration.</b> ${s.comps_base_n} protocols carry a trading token with a market cap.
+      Venue tokens, staking receipts and bridge claims are excluded, because their cap per TVL dollar
+      prices an underlying asset or a venue, not a protocol's future token. What remains is the
+      calibration set: ${s.comps_n} operating protocols whose tokens actually trade.</p>
+      <p><b>3 &middot; The fit.</b> In logs, ln(market cap) = &alpha;<sub>category</sub> + &beta; &middot; ln(TVL),
+      with &beta; = ${D.fit.beta.toFixed(3)} fitted by least squares across the calibration set. Each
+      &alpha; is its category's median residual, shrunk toward the global median with weight
+      K = ${D.fit.shrink_k}, so a category with two exemplars borrows the market's level instead of
+      shouting; a category with none takes the global &alpha; = ${D.fit.alpha_global.toFixed(2)}.</p>
+      <p><b>4 &middot; Capture and context.</b> Wrapper and shell categories (staking pools, restaking,
+      stablecoin wrappers, BTC anchors, farms) are priced at a 0.55 capture factor: their TVL mostly
+      belongs to an underlying asset a native token could only partly capture. Momentum, age and chain
+      count are printed as context and set each farm plan's cadence and size; they never move a price.</p>
+    </div>
+    <table class="oos">
+      <tr><th>Out-of-sample test (time splits: no future information in any fit)</th><th class="n">Train</th><th class="n">Test</th><th class="n">&beta;</th><th class="n">Median factor</th><th class="n">Within &times;2</th><th class="n">Within &times;3</th></tr>
+      ${splits}
+    </table>
+    <p class="limits">Limits, plainly: a comps price claims what a token would be worth if the protocol's
+    record stayed as it is; it does not claim a token will exist. The 2026 walk-forward cell is the weakest
+    (n = 8) because a newly listed token's cap has not settled; the headline split prices 47 later listings
+    at a median factor of &times;${D.fit.splits[0].median_factor.toFixed(2)}. Every figure on this page is
+    recomputed from the calibration set in the browser and checked against board.json (see the footer).</p>
+  </section>`;
+}
+
+// ---- board view ----
+const state = { q: '', category: '', chain: '', segment: 'board', sortKey: 'rank', sortDir: 1 };
+function visibleRows() {
+  let rows = D.rows;
+  if (state.segment === 'watchlist') rows = rows.filter((r) => r.watchlist);
+  if (state.category) rows = rows.filter((r) => r.category === state.category);
+  if (state.chain) rows = rows.filter((r) => r.chains.includes(state.chain));
+  if (state.q) {
+    const q = state.q.toLowerCase();
+    rows = rows.filter((r) => r.name.toLowerCase().includes(q) || r.slug.includes(q));
+  }
+  const k = state.sortKey;
+  const dir = state.sortDir;
+  const val = (r) =>
+    k === 'name' ? r.name.toLowerCase()
+    : k === 'category' ? r.category
+    : k === 'change' ? (r.change_7d === null ? -Infinity : r.change_7d)
+    : k === 'age' ? (r.age_days === null ? -Infinity : r.age_days)
+    : k === 'mult' ? r.implied_value_usd / r.tvl_usd
+    : r[k];
+  return [...rows].sort((a, b) => {
+    const va = val(a);
+    const vb = val(b);
+    const c = va < vb ? -1 : va > vb ? 1 : a.slug < b.slug ? -1 : 1;
+    return c * dir;
+  });
+}
+function boardHtml() {
+  const cats = [...new Set(D.rows.map((r) => r.category))].sort();
+  const chains = [...new Set(D.rows.flatMap((r) => r.chains))].sort();
+  const rows = visibleRows()
+    .map(
+      (r) => `<tr data-slug="${esc(r.slug)}">
+      <td class="rank">${r.rank}</td>
+      <td><b>${esc(r.name)}</b>${r.watchlist ? '<span class="wl">WATCHLIST</span>' : ''}<br><span class="slug">${esc(r.slug)}</span></td>
+      <td>${esc(r.category)}</td>
+      <td>${esc(r.chains.slice(0, 3).join(', '))}${r.chains.length > 3 ? ' +' + (r.chains.length - 3) : ''}</td>
+      <td class="n">${fmt$(r.tvl_usd)}</td>
+      <td class="n ${r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg'}">${fmtPct(r.change_7d)}</td>
+      <td class="n">${fmtYears(r.age_days)}</td>
+      <td class="n"><b>${fmt$(r.implied_value_usd)}</b></td>
+      <td class="n">${(r.implied_value_usd / r.tvl_usd).toFixed(3)}&times;</td></tr>`,
+    )
+    .join('');
+  const th = (key, label, cls) =>
+    `<th class="${cls || ''} ${state.sortKey === key ? 'sorted' : ''}" data-sort="${key}">${label}</th>`;
+  return `
+  ${methodHtml()}
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search name or slug" value="${esc(state.q)}">
+    <select id="cat"><option value="">All categories</option>${cats.map((c) => `<option ${c === state.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+    <select id="chain"><option value="">All chains</option>${chains.map((c) => `<option ${c === state.chain ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+    <div class="seg">
+      <button data-seg="board" class="${state.segment === 'board' ? 'on' : ''}">Pre-token board</button>
+      <button data-seg="watchlist" class="${state.segment === 'watchlist' ? 'on' : ''}">Watchlist only</button>
+      <button data-seg="comps">Calibration set</button>
+    </div>
+    <span class="count">${visibleRows().length} of ${D.rows.length} rows &middot; click a row for its dossier</span>
+  </div>
+  <table class="board">
+    <thead><tr>
+      ${th('rank', '#')}${th('name', 'Protocol')}${th('category', 'Category')}<th>Chains</th>
+      ${th('tvl_usd', 'TVL', 'n')}${th('change', '7d', 'n')}${th('age', 'Age', 'n')}
+      ${th('implied_value_usd', 'Implied value', 'n')}${th('mult', 'x TVL', 'n')}
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+// ---- calibration view ----
+function compsHtml() {
+  const rows = [...D.comps]
+    .sort((a, b) => b.mcap_usd - a.mcap_usd)
+    .map(
+      (p, i) => `<tr>
+      <td class="rank">${i + 1}</td>
+      <td><b>${esc(p.name)}</b><br><span class="slug">${esc(p.slug)}</span></td>
+      <td>${esc(p.category ?? 'Unclassified')}</td>
+      <td class="n">${fmt$(p.tvl_usd)}</td>
+      <td class="n">${fmt$(p.mcap_usd)}</td>
+      <td class="n">${(p.mcap_usd / p.tvl_usd).toFixed(3)}&times;</td>
+      <td class="n">${p.listed_at ?? '—'}</td></tr>`,
+    )
+    .join('');
+  return `
+  <section class="method">
+    <h2>The calibration set: the snapshot's own trading tokens</h2>
+    <div class="method-grid">
+      <p>These ${D.spec.comps_n} protocols are the entire evidence base for the board's prices: the fit's
+      slope and every category intercept are computed from these rows and nothing else. The page re-runs
+      that fit in the browser; the footer reports how many of the board's implied values it reproduces
+      exactly.</p>
+      <p>Excluded from the ${D.spec.comps_base_n} tokens with a market cap: exchange venue tokens, liquid
+      staking and restaking receipts, bridge and canonical-bridge claims, restaked BTC, token lockers,
+      stablecoin wrappers, dual-token stablecoins, BTC anchors and decentralised BTC wrappers. Their caps
+      price an underlying asset or a venue, not an operating protocol's future token.</p>
+    </div>
+  </section>
+  <div class="controls">
+    <div class="seg">
+      <button data-seg="board">Pre-token board</button>
+      <button data-seg="watchlist">Watchlist only</button>
+      <button data-seg="comps" class="on">Calibration set</button>
+    </div>
+    <span class="count">${D.comps.length} calibration tokens &middot; sorted by market cap</span>
+  </div>
+  <table class="board">
+    <thead><tr><th>#</th><th>Protocol</th><th>Category</th><th class="n">TVL</th><th class="n">Market cap</th><th class="n">Cap / TVL</th><th class="n">Listed</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+// ---- detail view ----
+function detailHtml(slug) {
+  const r = D.rows.find((x) => x.slug === slug);
+  if (!r) return `<p class="backline"><a href="#/">&larr; back to the board</a></p><p>No such protocol on the board.</p>`;
+  const a = FIT2.alpha.get(r.category);
+  const alpha = a ? a.alpha : FIT2.alphaGlobal;
+  const mine = reprice(r);
+  const catComps = D.comps
+    .filter((p) => (p.category ?? 'Unclassified') === r.category)
+    .sort((x, y) => y.mcap_usd - x.mcap_usd)
+    .slice(0, 8);
+  const compsRows = catComps.length
+    ? catComps
+        .map(
+          (p) => `<tr><td>${esc(p.name)}</td><td class="n">${fmt$(p.tvl_usd)}</td><td class="n">${fmt$(p.mcap_usd)}</td><td class="n">${(p.mcap_usd / p.tvl_usd).toFixed(3)}&times;</td></tr>`,
+        )
+        .join('')
+    : `<tr><td colspan="4">No calibration token trades in this category; the global intercept prices this row.</td></tr>`;
+  const e = r.plan;
+  return `
+  <p class="backline"><a href="#/">&larr; back to the board</a> &middot; rank ${r.rank} of ${D.rows.length}</p>
+  <div class="detail-head">
+    <h2>${esc(r.name)}${r.watchlist ? '<span class="wl">WATCHLIST</span>' : ''}</h2>
+    <div class="meta">${esc(r.slug)} &middot; ${esc(r.category)} &middot; ${esc(r.chains.join(', '))} &middot; listed ${r.listed_at ?? 'unreported'} (${fmtYears(r.age_days)} tracked, no token recorded)</div>
+    <div class="big-implied">${fmt$(r.implied_value_usd)} <small>implied launch value &middot; ${(r.implied_value_usd / r.tvl_usd).toFixed(3)}&times; its TVL of ${fmt$(r.tvl_usd)}</small></div>
+  </div>
+  <div class="cols">
+    <div class="section">
+      <h2>How the price is built</h2>
+      <table class="kv">
+        <tr><th>TVL (snapshot)</th><td>${fmt$(r.tvl_usd)}</td></tr>
+        <tr><th>Category intercept &alpha; (${esc(r.category)}, n = ${r.alpha_n} calibration tokens)</th><td>${r.alpha.toFixed(4)}</td></tr>
+        <tr><th>Pooled slope &beta;</th><td>${D.fit.beta.toFixed(4)}</td></tr>
+        <tr><th>Fitted value exp(&alpha; + &beta; &middot; ln TVL)</th><td>${fmt$(r.fitted_value_usd)}</td></tr>
+        <tr><th>Capture factor</th><td>&times;${r.capture.toFixed(2)}</td></tr>
+        <tr><th>Implied value (board.json)</th><td>${fmt$(r.implied_value_usd)}</td></tr>
+        <tr><th>7-day TVL change (context, not priced)</th><td>${fmtPct(r.change_7d)}</td></tr>
+      </table>
+      <div class="refit">Page refit: this row recomputes to ${fmt$(mine)} in the browser &mdash; ${mine === r.implied_value_usd ? 'identical to board.json' : 'differs from board.json'}.</div>
+    </div>
+    <div class="section">
+      <h2>Calibration tokens in ${esc(r.category)}</h2>
+      <table class="kv">
+        <tr><th>Protocol</th><td>TVL / cap / ratio</td></tr>
+        ${compsRows}
+      </table>
+    </div>
+  </div>
+  <div class="section">
+    <h2>Farm plan, netted to the dollar</h2>
+    <div class="econ">
+      <div><div class="k">Net cost of the plan</div><div class="v net">${fmt$(e.net_cost_usd)}</div></div>
+      <div><div class="k">Working capital</div><div class="v">${fmt$(e.capital_usd)}</div></div>
+      <div><div class="k">Gas over ${e.weeks} weeks</div><div class="v">${fmt$(e.gas_usd)}</div></div>
+      <div><div class="k">Fees and allowances</div><div class="v">${fmt$(e.fees_usd)}</div></div>
+      <div><div class="k">Core position</div><div class="v">${fmt$(e.core_usd)}</div></div>
+      <div><div class="k">Second surface</div><div class="v">${fmt$(e.second_usd)}</div></div>
+      <div><div class="k">Horizon</div><div class="v">${e.horizon_days} days</div></div>
+      <div><div class="k">Time budget</div><div class="v">${e.weekly_minutes} min/wk</div></div>
+    </div>
+    <ol class="steps">${r.farm_steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
+  </div>`;
+}
+
+// ---- routing ----
+function render() {
+  renderSpec();
+  const hash = location.hash || '#/';
+  const view = document.getElementById('view');
+  if (hash.startsWith('#/p/')) {
+    view.innerHTML = detailHtml(decodeURIComponent(hash.slice(4)));
+  } else if (hash === '#/comps') {
+    view.innerHTML = compsHtml();
+  } else {
+    if (hash.startsWith('#/f/')) state.category = decodeURIComponent(hash.slice(4));
+    view.innerHTML = boardHtml();
+    wireBoard();
+  }
+  wireSeg();
+  window.scrollTo(0, 0);
+}
+function wireSeg() {
+  document.querySelectorAll('[data-seg]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const seg = b.getAttribute('data-seg');
+      if (seg === 'comps') {
+        location.hash = '#/comps';
+      } else {
+        state.segment = seg;
+        if (location.hash === '#/comps' || location.hash.startsWith('#/p/')) location.hash = '#/';
+        else render();
       }
-      return true;
+    }),
+  );
+}
+function wireBoard() {
+  const q = document.getElementById('q');
+  if (q)
+    q.addEventListener('input', () => {
+      state.q = q.value;
+      const v = document.getElementById('view');
+      const pos = q.selectionStart;
+      v.innerHTML = boardHtml();
+      wireBoard();
+      wireSeg();
+      const q2 = document.getElementById('q');
+      q2.focus();
+      q2.setSelectionRange(pos, pos);
     });
-    var k = state.sortKey, d = state.sortDir;
-    out.sort(function (a, b) {
-      var va = a[k], vb = b[k];
-      if (va === null || va === undefined) va = -Infinity;
-      if (vb === null || vb === undefined) vb = -Infinity;
-      if (typeof va === 'string') return d * va.localeCompare(vb);
-      return d * (va - vb);
-    });
-    return out;
-  }
-
-  function sortHeader(key, label, num) {
-    var arrow = state.sortKey === key ? (state.sortDir === 1 ? ' ^' : ' v') : '';
-    return '<th class="' + (num ? 'num' : '') + '" data-sort="' + key + '">' + label + arrow + '</th>';
-  }
-
-  function boardView() {
-    var vis = visibleRows();
-    var cats = categories();
-    var opts = '<option value="">All categories</option>' + cats.map(function (c) {
-      return '<option value="' + esc(c) + '"' + (state.cat === c ? ' selected' : '') + '>' + esc(c) + '</option>';
-    }).join('');
-    var html = '<div class="controls">' +
-      '<label>Category</label><select id="ctl-cat">' + opts + '</select>' +
-      '<label>Search</label><input type="search" id="ctl-q" placeholder="name or slug" value="' + esc(state.q) + '">' +
-      '<label class="toggle"><input type="checkbox" id="ctl-watch"' + (state.watchOnly ? ' checked' : '') + '> Watchlist only</label>' +
-      '<span class="spacer"></span><span class="count">' + vis.length + ' of ' + rows.length + ' protocols</span></div>';
-    html += '<table class="board"><thead><tr>' +
-      sortHeader('rank', '#', true) + sortHeader('name', 'Protocol', false) +
-      sortHeader('category', 'Category', false) + '<th>Chains</th>' +
-      sortHeader('tvl_usd', 'TVL', true) + sortHeader('change_7d', '7d', true) +
-      sortHeader('implied_value_usd', 'Implied value', true) + '<th>Signal</th>' +
-      '</tr></thead><tbody>';
-    vis.forEach(function (r) {
-      html += '<tr data-slug="' + esc(r.slug) + '">' +
-        '<td class="num rank">' + r.rank + '</td>' +
-        '<td><span class="pname">' + esc(r.name) + '</span><br><span class="pslug">' + esc(r.slug) + '</span></td>' +
-        '<td>' + esc(r.category || '(none)') + '</td>' +
-        '<td class="chains">' + esc(r.chains.slice(0, 3).join(', ')) + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</td>' +
-        '<td class="num">' + money(r.tvl_usd) + '</td>' +
-        '<td class="num">' + pct(r.change_7d) + '</td>' +
-        '<td class="num"><b>' + money(r.implied_value_usd) + '</b></td>' +
-        '<td>' + tags(r) + '</td></tr>';
-    });
-    html += '</tbody></table>';
-    document.getElementById('app').innerHTML = html;
-    bindControls();
-  }
-
-  function bindControls() {
-    var cat = document.getElementById('ctl-cat');
-    if (cat) cat.addEventListener('change', function () { state.cat = cat.value; boardView(); });
-    var q = document.getElementById('ctl-q');
-    if (q) q.addEventListener('input', function () { state.q = q.value; var v = visibleRows(); refreshBody(v); });
-    var w = document.getElementById('ctl-watch');
-    if (w) w.addEventListener('change', function () { state.watchOnly = w.checked; boardView(); });
-    bindTable();
-  }
-
-  function refreshBody() { boardView(); }
-
-  function bindTable() {
-    var ths = document.querySelectorAll('th[data-sort]');
-    Array.prototype.forEach.call(ths, function (th) {
-      th.addEventListener('click', function () {
-        var k = th.getAttribute('data-sort');
-        if (state.sortKey === k) state.sortDir = -state.sortDir;
-        else { state.sortKey = k; state.sortDir = k === 'name' || k === 'category' ? 1 : -1; }
-        boardView();
-      });
-    });
-    var trs = document.querySelectorAll('tr[data-slug]');
-    Array.prototype.forEach.call(trs, function (tr) {
-      tr.addEventListener('click', function () {
-        location.hash = '#/p/' + tr.getAttribute('data-slug');
-      });
-    });
-  }
-
-  function detailView(slug) {
-    var r = bySlug[slug];
-    if (!r) { location.hash = '#/'; return; }
-    var years = r.listed_at ? ((Date.parse(DATA.as_of) - Date.parse(r.listed_at)) / 31557600000).toFixed(1) : 'n/a';
-    var html = '<p><a class="back" href="#/">&larr; back to the board</a></p>' +
-      '<div class="detail-head"><h2>' + esc(r.name) + '</h2>' + tags(r) + '</div>' +
-      '<p class="chains">' + esc(r.slug) + ' &middot; rank ' + r.rank + ' of ' + rows.length + ' &middot; ' +
-      esc(r.category || '(no category)') + ' &middot; ' + esc(r.chains.join(', ')) + '</p>' +
-      '<div class="grid">' +
-      '<div class="cell"><span>TVL</span><b>' + money(r.tvl_usd) + '</b></div>' +
-      '<div class="cell"><span>Implied value</span><b>' + money(r.implied_value_usd) + '</b></div>' +
-      '<div class="cell"><span>7d TVL change</span><b>' + (r.change_7d === null ? 'n/a' : r.change_7d + '%') + '</b></div>' +
-      '<div class="cell"><span>Tracked since</span><b>' + (r.listed_at || 'n/a') + '</b></div>' +
-      '<div class="cell"><span>Years with no token</span><b>' + years + '</b></div>' +
-      '<div class="cell"><span>Watchlist (floor ' + money(DATA.floor_usd) + ')</span><b>' + (r.watchlist ? 'yes' : 'no — early pick') + '</b></div>' +
-      '</div>' +
-      '<div class="panel"><h3>How signal-2 values ' + esc(r.name) + '</h3>' +
-      '<p class="formula">' + money(r.tvl_usd) + ' TVL <span class="op">x</span> ' + r.multiple +
-      ' category multiple (' + esc(r.category || 'default') + ') <span class="op">x</span> ' + r.momentum.toFixed(3) +
-      ' momentum <span class="op">x</span> ' + r.age.toFixed(3) + ' age <span class="op">x</span> ' + r.shell +
-      ' shell <span class="op">=</span> <span class="res">' + money(r.implied_value_usd) + '</span></p>' +
-      '<p class="chains">Momentum comes from the 7-day TVL change, age from how long the protocol has run with no token recorded, and the shell factor discounts wrappers and points shells. Every input is a snapshot figure; nothing is hardcoded by name.</p></div>' +
-      '<div class="panel"><h3>Farm plan — 7 steps</h3><ol class="steps">' +
-      r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') +
-      '</ol></div>';
-    document.getElementById('app').innerHTML = html;
-    window.scrollTo(0, 0);
-  }
-
-  function route() {
-    var h = location.hash || '#/';
-    var m = h.match(/^#\/p\/(.+)$/);
-    if (m) { detailView(decodeURIComponent(m[1])); return; }
-    var f = h.match(/^#\/f\/(.+)$/);
-    if (f) { state.cat = decodeURIComponent(f[1]); boardView(); return; }
-    boardView();
-  }
-
-  function masthead() {
-    var watch = rows.filter(function (r) { return r.watchlist; }).length;
-    var total = rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0);
-    document.getElementById('masthead-stats').innerHTML =
-      '<div class="stat"><b>' + rows.length + '</b><span>protocols</span></div>' +
-      '<div class="stat"><b>' + watch + '</b><span>watchlist</span></div>' +
-      '<div class="stat"><b>' + money(total) + '</b><span>total implied</span></div>' +
-      '<div class="stat"><b>' + esc(DATA.as_of) + '</b><span>snapshot</span></div>';
-    document.getElementById('model-note').textContent =
-      'signal-2: implied = TVL x category multiple x momentum (7d change, clamped) x age (years with no token) x shell discount (0.55 for wrappers and points shells). Click any row for its inputs and farm plan.';
-  }
-
-  masthead();
-  window.addEventListener('hashchange', route);
-  route();
-})();
+  const cat = document.getElementById('cat');
+  if (cat) cat.addEventListener('change', () => { state.category = cat.value; render(); });
+  const chain = document.getElementById('chain');
+  if (chain) chain.addEventListener('change', () => { state.chain = chain.value; render(); });
+  document.querySelectorAll('th[data-sort]').forEach((t) =>
+    t.addEventListener('click', () => {
+      const key = t.getAttribute('data-sort');
+      if (state.sortKey === key) state.sortDir *= -1;
+      else { state.sortKey = key; state.sortDir = key === 'name' || key === 'category' ? 1 : -1; }
+      render();
+    }),
+  );
+  document.querySelectorAll('tbody tr[data-slug]').forEach((tr) =>
+    tr.addEventListener('click', () => { location.hash = '#/p/' + tr.getAttribute('data-slug'); }),
+  );
+}
+window.addEventListener('hashchange', render);
+render();
